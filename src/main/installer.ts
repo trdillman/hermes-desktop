@@ -377,6 +377,90 @@ export async function runHermesUpdate(
   });
 }
 
+function getSudoExecutable(): string | null {
+  for (const candidate of [
+    "/usr/bin/sudo",
+    "/bin/sudo",
+    "/usr/local/bin/sudo",
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function validateSudoCredentials(
+  askpass: AskpassHandle,
+  basePath: string,
+  home: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const sudo = getSudoExecutable();
+    if (!sudo) {
+      resolve();
+      return;
+    }
+
+    let stderr = "";
+    const proc = spawn(sudo, ["-A", "-v"], {
+      cwd: home,
+      env: {
+        ...process.env,
+        ...askpass.env,
+        PATH: basePath,
+        HOME: home,
+        TERM: "dumb",
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    proc.stderr?.on("data", (data: Buffer) => {
+      stderr += stripAnsi(data.toString());
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new Error(
+            stderr.trim() || `sudo credential validation failed (${code})`,
+          ),
+        );
+      }
+    });
+
+    proc.on("error", (err) => {
+      reject(err);
+    });
+  });
+}
+
+function startSudoKeepAlive(
+  askpass: AskpassHandle,
+  basePath: string,
+  home: string,
+): ReturnType<typeof setInterval> {
+  const timer = setInterval(() => {
+    void validateSudoCredentials(askpass, basePath, home).catch(() => {
+      /* best-effort refresh; installer output will report sudo failures */
+    });
+  }, 60_000);
+  timer.unref?.();
+  return timer;
+}
+
+function buildInstallerEnv(basePath: string, home: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: basePath,
+    HOME: home,
+    TERM: "dumb",
+  };
+  delete env.SUDO_ASKPASS;
+  delete env.HERMES_ASKPASS_TOKEN;
+  return env;
+}
+
 function getShellProfile(home: string): string | null {
   // Check for the user's shell profile to source their PATH
   const candidates = [
@@ -462,9 +546,11 @@ export async function runInstall(
 
   emit("Running official Hermes install script...\n");
 
-  // Bridge any sudo prompts from install.sh to a GUI password dialog.
+  // Prime sudo credentials through a GUI password dialog, but do not expose
+  // the askpass program or token to the installer environment.
   // Windows has no sudo, so skip the bridge there.
   let askpass: AskpassHandle | null = null;
+  let sudoKeepAlive: ReturnType<typeof setInterval> | null = null;
   if (process.platform !== "win32") {
     try {
       askpass = await setupAskpass(parentWindow ?? null);
@@ -476,9 +562,21 @@ export async function runInstall(
   }
 
   try {
-    return await new Promise<void>((resolve, reject) => {
-      const home = homedir();
+    const home = homedir();
+    const basePath = getEnhancedPath();
 
+    if (askpass) {
+      try {
+        await validateSudoCredentials(askpass, basePath, home);
+        sudoKeepAlive = startSudoKeepAlive(askpass, basePath, home);
+      } catch (err) {
+        emit(
+          `\n[askpass] Could not validate sudo credentials: ${(err as Error).message}\n`,
+        );
+      }
+    }
+
+    return await new Promise<void>((resolve, reject) => {
       // Source the user's shell profile to get the same PATH as their terminal,
       // then run the official install script. Electron apps launched from Finder
       // don't inherit the terminal environment.
@@ -488,16 +586,9 @@ export async function runInstall(
         "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup",
       ].join(" ");
 
-      const basePath = getEnhancedPath();
       const proc = spawn("bash", ["-c", installCmd], {
         cwd: home,
-        env: {
-          ...process.env,
-          PATH: askpass ? `${askpass.pathPrepend}:${basePath}` : basePath,
-          HOME: home,
-          TERM: "dumb",
-          ...(askpass?.env ?? {}),
-        },
+        env: buildInstallerEnv(basePath, home),
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -537,6 +628,7 @@ export async function runInstall(
       });
     });
   } finally {
+    if (sudoKeepAlive) clearInterval(sudoKeepAlive);
     askpass?.cleanup();
   }
 }

@@ -7,18 +7,16 @@ import { randomBytes } from "crypto";
 
 export interface AskpassHandle {
   env: Record<string, string>;
-  pathPrepend: string;
   cleanup: () => void;
 }
 
 /**
  * Bridge sudo's password prompt to a GUI dialog.
  *
- * Writes two scripts into a temp dir:
- *   - askpass.sh: invoked by `sudo -A`. Talks to a unix socket we listen on,
- *     receives the password, prints it to stdout.
- *   - sudo: a PATH shim that forces real sudo to use `-A`, so install
- *     scripts that call plain `sudo` still trigger our askpass.
+ * Writes an askpass script into a temp dir. The script is invoked only by
+ * controlled `sudo -A` validation/refresh processes with a per-setup token in
+ * their environment, talks to a unix socket we listen on, receives the
+ * password, and prints it to stdout.
  *
  * Caller must invoke `cleanup()` when the install/update finishes.
  */
@@ -28,7 +26,7 @@ export async function setupAskpass(
   const dir = mkdtempSync(join(tmpdir(), "hermes-askpass-"));
   const sockPath = join(dir, "ipc.sock");
   const askpassPath = join(dir, "askpass.sh");
-  const sudoShim = join(dir, "sudo");
+  const token = randomBytes(32).toString("hex");
 
   // The askpass program. sudo invokes this with a single arg (the prompt).
   // We pipe through python3 because it's available on every macOS/Linux box
@@ -37,11 +35,14 @@ export async function setupAskpass(
     askpassPath,
     `#!/bin/sh
 exec /usr/bin/env python3 - "$@" <<'PY'
-import socket, sys
+import os, socket, sys
+token = os.environ.get("HERMES_ASKPASS_TOKEN", "")
+if not token:
+    sys.exit(1)
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect(${JSON.stringify(sockPath)})
 prompt = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Password:"
-s.sendall((prompt + "\\n").encode())
+s.sendall((token + "\\n" + prompt + "\\n").encode())
 buf = b""
 while True:
     chunk = s.recv(4096)
@@ -55,26 +56,18 @@ PY
   );
   chmodSync(askpassPath, 0o755);
 
-  // PATH shim: any plain `sudo` call gets rewritten to `sudo -A`.
-  // /usr/bin/sudo is the standard location on macOS and ~all Linux distros.
-  writeFileSync(
-    sudoShim,
-    `#!/bin/sh
-for p in /usr/bin/sudo /bin/sudo /usr/local/bin/sudo; do
-  if [ -x "$p" ]; then exec "$p" -A "$@"; fi
-done
-echo "sudo not found" >&2
-exit 1
-`,
-  );
-  chmodSync(sudoShim, 0o755);
-
   const server = net.createServer((conn) => {
     let buf = "";
     conn.on("data", async (chunk) => {
       buf += chunk.toString();
-      if (!buf.includes("\n")) return;
-      const prompt = buf.split("\n")[0];
+      const lines = buf.split("\n");
+      if (lines.length < 3) return;
+      const requestToken = lines[0];
+      const prompt = lines[1];
+      if (requestToken !== token) {
+        conn.end();
+        return;
+      }
       const pw = await showPasswordDialog(parent, prompt);
       if (pw === null) {
         conn.end();
@@ -100,8 +93,7 @@ exit 1
   });
 
   return {
-    env: { SUDO_ASKPASS: askpassPath },
-    pathPrepend: dir,
+    env: { SUDO_ASKPASS: askpassPath, HERMES_ASKPASS_TOKEN: token },
     cleanup: () => {
       try {
         server.close();
