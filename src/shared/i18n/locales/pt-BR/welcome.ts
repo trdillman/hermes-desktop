@@ -18,5 +18,5 @@ export default {
   remoteApiKeyPlaceholder: "Token Bearer (API_SERVER_KEY)",
   testingConnection: "Testando",
   connect: "Conectar",
-  remoteHint: "Deixe a chave vazia se o servidor aceitar requisições não autenticadas (ex: via túnel SSH para o localhost).",
+  remoteHint: "Use HTTPS ao inserir uma chave de API. HTTP com chave só é permitido para túneis SSH em localhost/127.0.0.1.",
 } as const;

@@ -492,7 +492,7 @@ function Settings({ profile }: { profile?: string }): React.JSX.Element {
                 type="url"
                 value={connRemoteUrl}
                 onChange={(e) => setConnRemoteUrl(e.target.value)}
-                placeholder="http://192.168.1.100:8642"
+                placeholder="https://hermes.example.com:8642"
                 onBlur={handleSaveConnection}
               />
               <div className="settings-field-hint">

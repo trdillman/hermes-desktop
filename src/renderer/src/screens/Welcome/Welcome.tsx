@@ -72,7 +72,7 @@ function Welcome({
           <input
             type="url"
             className="welcome-remote-input"
-            placeholder="http://192.168.1.100:8642"
+            placeholder="https://hermes.example.com:8642"
             value={remoteUrl}
             onChange={(e) => setRemoteUrl(e.target.value)}
             onKeyDown={(e) => {
