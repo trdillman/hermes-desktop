@@ -16,6 +16,31 @@ import { stripAnsi } from "./utils";
 
 const LOCAL_API_URL = "http://127.0.0.1:8642";
 
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    normalized === "0:0:0:0:0:0:0:1" ||
+    /^127(?:\.\d{1,3}){3}$/.test(normalized)
+  );
+}
+
+export function canSendRemoteApiKey(url: string, apiKey?: string): boolean {
+  if (!apiKey) return true;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "https:") return true;
+    return parsed.protocol === "http:" && isLoopbackHostname(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function getInsecureRemoteApiKeyError(): string {
+  return "Remote API keys require HTTPS, or HTTP to localhost/127.0.0.1 for SSH tunnels.";
+}
+
 export function getApiUrl(): string {
   const conn = getConnectionConfig();
   if (conn.mode === "remote" && conn.remoteUrl) {
@@ -30,7 +55,11 @@ export function isRemoteMode(): boolean {
 
 export function getRemoteAuthHeader(): Record<string, string> {
   const conn = getConnectionConfig();
-  if (conn.mode === "remote" && conn.apiKey) {
+  if (
+    conn.mode === "remote" &&
+    conn.apiKey &&
+    canSendRemoteApiKey(conn.remoteUrl, conn.apiKey)
+  ) {
     return { Authorization: `Bearer ${conn.apiKey}` };
   }
   return {};
@@ -69,6 +98,15 @@ interface ChatHandle {
 
 function isApiServerReady(): Promise<boolean> {
   return new Promise((resolve) => {
+    const conn = getConnectionConfig();
+    if (
+      conn.mode === "remote" &&
+      conn.apiKey &&
+      !canSendRemoteApiKey(conn.remoteUrl, conn.apiKey)
+    ) {
+      resolve(false);
+      return;
+    }
     const url = `${getApiUrl()}/health`;
     const mod = url.startsWith("https") ? https : http;
     const req = mod.request(
@@ -140,6 +178,16 @@ function sendMessageViaApi(
   _resumeSessionId?: string,
   history?: Array<{ role: string; content: string }>,
 ): ChatHandle {
+  const conn = getConnectionConfig();
+  if (
+    conn.mode === "remote" &&
+    conn.apiKey &&
+    !canSendRemoteApiKey(conn.remoteUrl, conn.apiKey)
+  ) {
+    queueMicrotask(() => cb.onError(getInsecureRemoteApiKeyError()));
+    return { abort: () => undefined };
+  }
+
   const mc = getModelConfig(profile);
   const controller = new AbortController();
 
@@ -767,6 +815,10 @@ export function testRemoteConnection(
   apiKey?: string,
 ): Promise<boolean> {
   return new Promise((resolve) => {
+    if (apiKey && !canSendRemoteApiKey(url, apiKey)) {
+      resolve(false);
+      return;
+    }
     const target = `${url.replace(/\/+$/, "")}/health`;
     const mod = target.startsWith("https") ? https : http;
     const headers: Record<string, string> = {};
